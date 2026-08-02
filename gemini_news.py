@@ -39,6 +39,7 @@ HEADERS = {
 
 MAX_AGE_HOURS = 24
 TOP_N = 15
+MAX_SUMMARY_POINTS = 10
 
 # One Google News RSS search per topic — "when:1d" is Google's own (loose)
 # recency filter; get_fresh_headlines() re-checks precisely against each
@@ -116,11 +117,12 @@ class RankedSummary(BaseModel):
             "developments). Ordered most significant first."
         )
     )
-    market_summary: str = Field(
+    market_bullets: list[str] = Field(
         description=(
-            "A concise synthesis (no more than 200 words) of the key market impacts and "
-            "geopolitical developments across the selected headlines, focused on drivers "
-            "relevant to polymer/petrochemical pricing."
+            f"At most {MAX_SUMMARY_POINTS} concise bullet points (one sentence each, no leading "
+            "dash or bullet character — the UI adds that) synthesizing the key market impacts and "
+            "geopolitical developments across the selected headlines, focused on drivers relevant "
+            "to polymer/petrochemical pricing. Most significant point first."
         )
     )
 
@@ -143,9 +145,9 @@ From this list, select at most {TOP_N} headlines most relevant to polymer market
 and India-specific economic/energy developments), ordered most significant first, and return
 their indices.
 
-Then write one market summary of no more than 200 words synthesizing the key market impacts
-and geopolitical developments across the selected headlines, focused on implications for
-polymer/petrochemical pricing.
+Then write at most {MAX_SUMMARY_POINTS} concise bullet points (one sentence each) synthesizing
+the key market impacts and geopolitical developments across the selected headlines, focused on
+implications for polymer/petrochemical pricing. Order the most significant point first.
 """.strip()
 
 
@@ -173,10 +175,14 @@ def summarize_headlines(headlines: list[ScrapedHeadline]) -> RankedSummary:
     return RankedSummary.model_validate_json(interaction.output_text)
 
 
-def store_digest(picked: list[ScrapedHeadline], summary: str) -> None:
+def store_digest(picked: list[ScrapedHeadline], bullets: list[str]) -> None:
     """Upserts into Supabase: news_items deduped on url, news_summary
     always overwriting the single id=1 row. No-ops with a note if Supabase
-    env vars aren't set yet."""
+    env vars aren't set yet.
+
+    news_summary.summary stays a plain text column (no schema migration) —
+    bullets are joined with newlines on write and split back apart by
+    whatever reads them (PolyInsights' news_digest_service.py)."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         print("(SUPABASE_URL/SUPABASE_SERVICE_KEY not set — skipping persistence)")
         return
@@ -196,11 +202,15 @@ def store_digest(picked: list[ScrapedHeadline], summary: str) -> None:
         client.table("news_items").upsert(rows, on_conflict="url", ignore_duplicates=True).execute()
 
     client.table("news_summary").upsert(
-        {"id": 1, "summary": summary, "generated_at": datetime.now(timezone.utc).isoformat()},
+        {
+            "id": 1,
+            "summary": "\n".join(bullets),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
         on_conflict="id",
     ).execute()
 
-    print(f"Stored {len(picked)} headline(s) + summary in Supabase.")
+    print(f"Stored {len(picked)} headline(s) + {len(bullets)} summary point(s) in Supabase.")
 
 
 if __name__ == "__main__":
@@ -227,7 +237,11 @@ if __name__ == "__main__":
             print(f"    {h.url}")
             print()
 
-        print("Market Summary")
-        print(result.market_summary)
+        # Belt-and-braces cap, same reasoning as the indices above.
+        bullets = result.market_bullets[:MAX_SUMMARY_POINTS]
 
-        store_digest(picked, result.market_summary)
+        print("Market Commentary")
+        for point in bullets:
+            print(f"- {point}")
+
+        store_digest(picked, bullets)
