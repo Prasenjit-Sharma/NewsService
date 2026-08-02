@@ -1,19 +1,3 @@
-"""
-Fetches real, recent headlines (crude oil/energy, global conflicts/
-geopolitics, India economy) via RSS, then asks Gemini to rank the most
-relevant subset for a polymer/petrochemical pricing desk and write a market
-summary. Gemini is only trusted to (a) pick from what was actually fetched,
-by index, and (b) write the summary — never to reproduce headline/url
-itself, so there's no risk of it subtly mangling a link.
-
-Source: feedparser against Google News' RSS search endpoint, once per topic.
-This aggregates across many outlets instead of scraping one site's HTML.
-
-Requires: pip install -r requirements.txt
-
-Run hourly via .github/workflows/news-digest.yml. Currently just prints the
-digest; a follow-up will have it upsert into Supabase instead.
-"""
 from __future__ import annotations
 
 import os
@@ -28,6 +12,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
+from supabase import Client, create_client
 
 # Loads .env for local runs; a no-op in GitHub Actions, where these are
 # injected directly as environment variables (see the workflow file).
@@ -37,6 +22,13 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 # Overridable without touching code: set GEMINI_MODEL in .env locally, or as
 # a repo Variable (not Secret — it isn't sensitive) in GitHub Actions.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+
+# Same Supabase project PolyInsights will eventually use for everything else
+# it's migrating off Google Sheets — these two tables are just its first
+# occupants. Optional for now (script still just prints if unset) so the
+# existing hourly run keeps working right up until these are added.
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
 HEADERS = {
     "User-Agent": (
@@ -54,7 +46,7 @@ TOP_N = 15
 RSS_TOPICS: dict[str, str] = {
     "Crude oil & energy": "crude oil OR OPEC OR oil prices OR refinery",
     "Global conflicts & geopolitics": "war OR conflict OR geopolitical tensions",
-    "India economy & energy": "India economy OR India energy OR India trade",
+    "India economy & energy": "India economy OR India energy OR India trade OR India politics or India Sensex or India Nifty",
 }
 
 
@@ -181,6 +173,36 @@ def summarize_headlines(headlines: list[ScrapedHeadline]) -> RankedSummary:
     return RankedSummary.model_validate_json(interaction.output_text)
 
 
+def store_digest(picked: list[ScrapedHeadline], summary: str) -> None:
+    """Upserts into Supabase: news_items deduped on url, news_summary
+    always overwriting the single id=1 row. No-ops with a note if Supabase
+    env vars aren't set yet."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        print("(SUPABASE_URL/SUPABASE_SERVICE_KEY not set — skipping persistence)")
+        return
+
+    client: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+    if picked:
+        rows = [
+            {
+                "headline": h.headline,
+                "url": h.url,
+                "category": h.category,
+                "published_at": h.published_at.isoformat(),
+            }
+            for h in picked
+        ]
+        client.table("news_items").upsert(rows, on_conflict="url", ignore_duplicates=True).execute()
+
+    client.table("news_summary").upsert(
+        {"id": 1, "summary": summary, "generated_at": datetime.now(timezone.utc).isoformat()},
+        on_conflict="id",
+    ).execute()
+
+    print(f"Stored {len(picked)} headline(s) + summary in Supabase.")
+
+
 if __name__ == "__main__":
     fresh_headlines = get_fresh_headlines()
 
@@ -207,3 +229,5 @@ if __name__ == "__main__":
 
         print("Market Summary")
         print(result.market_summary)
+
+        store_digest(picked, result.market_summary)
