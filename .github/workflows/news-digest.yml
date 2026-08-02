@@ -22,6 +22,9 @@ jobs:
       - run: python gemini_news.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Repo Variable, not Secret — it's just config, not sensitive.
+          # Falls back to the script's default if unset.
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
 
       # GitHub auto-disables a scheduled workflow after 60 days with zero
       # repo activity. This is the only commit this repo ever gets, so

@@ -15,13 +15,29 @@ re-running Gemini per request.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-export GEMINI_API_KEY=your-key-here
+```
+
+Create a `.env` file (already gitignored, never committed) in the repo root:
+
+```
+GEMINI_API_KEY=your-key-here
+GEMINI_MODEL=gemini-3.5-flash
+```
+
+`GEMINI_MODEL` is optional — omit it to use the script's default. Then:
+
+```bash
 python gemini_news.py
 ```
 
 ## GitHub Actions setup
 
-Add a repository secret named `GEMINI_API_KEY` (Settings → Secrets and
-variables → Actions → New repository secret). The `news-digest` workflow
-(`.github/workflows/news-digest.yml`) runs every hour, and can also be
-triggered manually from the Actions tab (`workflow_dispatch`).
+- **Secret** `GEMINI_API_KEY` — Settings → Secrets and variables → Actions →
+  **Secrets** tab → New repository secret.
+- **Variable** `GEMINI_MODEL` (optional) — same page, **Variables** tab →
+  New repository variable. Lets you switch the Gemini model for scheduled
+  runs without touching code. Leave unset to use the script's default.
+
+The `news-digest` workflow (`.github/workflows/news-digest.yml`) runs every
+hour, and can also be triggered manually from the Actions tab
+(`workflow_dispatch`).

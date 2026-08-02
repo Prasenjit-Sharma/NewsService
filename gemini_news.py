@@ -24,12 +24,19 @@ from urllib.parse import quote
 
 import feedparser
 import requests
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
+# Loads .env for local runs; a no-op in GitHub Actions, where these are
+# injected directly as environment variables (see the workflow file).
+load_dotenv()
+
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = "gemini-3.5-flash"
+# Overridable without touching code: set GEMINI_MODEL in .env locally, or as
+# a repo Variable (not Secret — it isn't sensitive) in GitHub Actions.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 
 HEADERS = {
     "User-Agent": (
