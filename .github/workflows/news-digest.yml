@@ -1,0 +1,36 @@
+name: News digest
+
+on:
+  schedule:
+    - cron: "0 * * * *" # every hour
+  workflow_dispatch: {} # lets you trigger it manually from the Actions tab
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed for the self-commit step below
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - run: pip install -r requirements.txt
+
+      - run: python gemini_news.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      # GitHub auto-disables a scheduled workflow after 60 days with zero
+      # repo activity. This is the only commit this repo ever gets, so
+      # without it the schedule would eventually go quiet on its own.
+      - name: Record run (keeps the schedule alive)
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > last_run.txt
+          git config user.email "actions@github.com"
+          git config user.name "news-digest-bot"
+          git add last_run.txt
+          git diff --cached --quiet || git commit -m "chore: record run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
