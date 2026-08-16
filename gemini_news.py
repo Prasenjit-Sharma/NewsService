@@ -4,6 +4,8 @@ import os
 from calendar import timegm
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from typing import Optional
 from urllib.parse import quote
 
 import feedparser
@@ -23,9 +25,8 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 # a repo Variable (not Secret — it isn't sensitive) in GitHub Actions.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 
-# Same Supabase project PolyInsights will eventually use for everything else
-# it's migrating off Google Sheets — these two tables are just its first
-# occupants. Optional for now (script still just prints if unset) so the
+# Same Supabase project PolyInsights uses for everything else it's migrated
+# off Google Sheets. Optional (script still just prints if unset) so the
 # existing hourly run keeps working right up until these are added.
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
@@ -41,6 +42,13 @@ MAX_AGE_HOURS = 24
 TOP_N = 15
 MAX_SUMMARY_POINTS = 10
 
+# Polymer price news is scraped separately (plastemart_news.py, every 6h)
+# into news_items under this category — read here as the highest-priority
+# prompt input.
+POLYMER_NEWS_CATEGORY = "Polymer News"
+POLYMER_NEWS_MAX_AGE_HOURS = 48
+POLYMER_NEWS_LIMIT = 15
+
 # One Google News RSS search per topic — "when:1d" is Google's own (loose)
 # recency filter; get_fresh_headlines() re-checks precisely against each
 # entry's real published timestamp below.
@@ -49,6 +57,13 @@ RSS_TOPICS: dict[str, str] = {
     "Global conflicts & geopolitics": "war OR conflict OR geopolitical tensions",
     "India economy & energy": "India economy OR India energy OR India trade OR India politics or India Sensex or India Nifty",
 }
+
+
+@lru_cache
+def _get_client() -> Optional[Client]:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return None
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 def _google_news_rss_url(query: str) -> str:
@@ -108,50 +123,123 @@ def get_fresh_headlines() -> list[ScrapedHeadline]:
     return fresh
 
 
+@dataclass
+class PolymerNewsRow:
+    title: str
+    details: str
+    published_at: datetime
+    hours_ago: float
+
+
+def get_recent_polymer_news() -> list[PolymerNewsRow]:
+    """Reads price-news rows written by plastemart_news.py (runs every 6h,
+    separate schedule) into the same news_items table as RSS headlines,
+    tagged category="Polymer News" — treated as the highest-priority
+    prompt input since it's a direct, real price-change announcement
+    rather than a headline Gemini has to infer market relevance from."""
+    client = _get_client()
+    if client is None:
+        return []
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=POLYMER_NEWS_MAX_AGE_HOURS)
+    try:
+        response = (
+            client.table("news_items")
+            .select("headline,details,fetched_at")
+            .eq("category", POLYMER_NEWS_CATEGORY)
+            .gte("fetched_at", cutoff.isoformat())
+            .order("fetched_at", desc=True)
+            .limit(POLYMER_NEWS_LIMIT)
+            .execute()
+        )
+    except Exception:
+        return []
+
+    rows: list[PolymerNewsRow] = []
+    for r in response.data:
+        published_at = datetime.fromisoformat(r["fetched_at"])
+        rows.append(
+            PolymerNewsRow(
+                title=r["headline"],
+                details=r["details"],
+                published_at=published_at,
+                hours_ago=(now - published_at).total_seconds() / 3600,
+            )
+        )
+    return rows
+
+
+class MarketBullet(BaseModel):
+    text: str = Field(
+        description=(
+            "One short, concise sentence (no more than ~18 words, no leading dash or bullet "
+            "character — the UI adds that) covering a single market-relevant point."
+        )
+    )
+    source_ref: str = Field(
+        pattern=r"^[PH]\d+$",
+        description=(
+            "The single P# (polymer price news) or H# (general headline) label from the lists "
+            "above that this bullet is primarily based on, e.g. 'P2' or 'H5'."
+        ),
+    )
+
+
 class RankedSummary(BaseModel):
     selected_indices: list[int] = Field(
         description=(
-            f"0-based indices into the provided headline list — at most {TOP_N} — chosen for "
-            "relevance to polymer market drivers (crude oil prices/supply, global conflicts/wars/"
-            "geopolitical tensions affecting energy or trade, and India-specific economic/energy "
-            "developments). Ordered most significant first."
+            f"0-based indices into the H-list (general headlines) only — at most {TOP_N} — chosen "
+            "for relevance to polymer market drivers (crude oil prices/supply, global conflicts/"
+            "wars/geopolitical tensions affecting energy or trade, and India-specific economic/"
+            "energy developments). Ordered most significant first."
         )
     )
-    market_bullets: list[str] = Field(
+    market_bullets: list[MarketBullet] = Field(
         description=(
-            f"At most {MAX_SUMMARY_POINTS} concise bullet points (one sentence each, no leading "
-            "dash or bullet character — the UI adds that) synthesizing the key market impacts and "
-            "geopolitical developments across the selected headlines, focused on drivers relevant "
-            "to polymer/petrochemical pricing. Most significant point first."
+            f"At most {MAX_SUMMARY_POINTS} bullet points synthesizing the key market impacts "
+            "and geopolitical developments, focused on drivers relevant to polymer/petrochemical "
+            "pricing. If any polymer price news (P-list) is present, it must be represented first, "
+            "ahead of bullets drawn only from general headlines. Most significant point first."
         )
     )
 
 
-def build_prompt(headlines: list[ScrapedHeadline]) -> str:
-    listing = "\n".join(
-        f"{i}. [{h.category}] [{h.hours_ago:.1f}h ago] {h.headline}" for i, h in enumerate(headlines)
+def build_prompt(polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHeadline]) -> str:
+    polymer_listing = (
+        "\n".join(f"P{i}. [{p.hours_ago:.1f}h ago] {p.details}" for i, p in enumerate(polymer_news))
+        if polymer_news
+        else "(none available this run)"
+    )
+    headline_listing = "\n".join(
+        f"H{i}. [{h.category}] [{h.hours_ago:.1f}h ago] {h.headline}" for i, h in enumerate(headlines)
     )
     return f"""
 You are a market intelligence analyst for a polymer/petrochemical pricing desk.
 
-Below is a real, freshly aggregated list of headlines (each published within the last
-{MAX_AGE_HOURS} hours) covering crude oil/energy, global conflicts/geopolitics, and India's
-economy. Do not invent new headlines — only choose from this list.
+POLYMER PRICE NEWS — HIGHEST PRIORITY. Real price-change announcements scraped directly from
+the Indian polymer market (last {POLYMER_NEWS_MAX_AGE_HOURS}h). If any are present, your bullets
+MUST reflect them first, ahead of anything drawn only from the general headlines below.
 
-{listing}
+{polymer_listing}
 
-From this list, select at most {TOP_N} headlines most relevant to polymer market drivers
-(crude oil prices/supply, global conflicts/geopolitical tensions affecting energy or trade,
-and India-specific economic/energy developments), ordered most significant first, and return
-their indices.
+GENERAL MARKET HEADLINES (last {MAX_AGE_HOURS}h) — crude oil/energy, global conflicts/
+geopolitics, and India's economy. Do not invent new headlines — only choose from this list.
 
-Then write at most {MAX_SUMMARY_POINTS} concise bullet points (one sentence each) synthesizing
-the key market impacts and geopolitical developments across the selected headlines, focused on
-implications for polymer/petrochemical pricing. Order the most significant point first.
+{headline_listing}
+
+From the general headlines (H-list) only, select at most {TOP_N} most relevant to polymer
+market drivers (crude oil prices/supply, global conflicts/geopolitical tensions affecting
+energy or trade, and India-specific economic/energy developments), ordered most significant
+first, and return their H-indices as selected_indices.
+
+Then write at most {MAX_SUMMARY_POINTS} bullet points synthesizing the key market impacts across
+both lists, most significant first, tagging each with the single P#/H# label it's primarily
+based on.
 """.strip()
 
 
-def summarize_headlines(headlines: list[ScrapedHeadline]) -> RankedSummary:
+def summarize(polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHeadline]) -> RankedSummary:
     # attempts=1 disables the SDK's default retry-on-429 behavior, which
     # would otherwise burn through this project's small free-tier quota
     # retrying a request that's already over the per-minute limit.
@@ -162,7 +250,7 @@ def summarize_headlines(headlines: list[ScrapedHeadline]) -> RankedSummary:
 
     interaction = client.interactions.create(
         model=GEMINI_MODEL,
-        input=build_prompt(headlines),
+        input=build_prompt(polymer_news, headlines),
         # No tools needed — the model is summarizing/ranking headlines we
         # already fetched, not searching the web itself.
         response_format={
@@ -175,14 +263,33 @@ def summarize_headlines(headlines: list[ScrapedHeadline]) -> RankedSummary:
     return RankedSummary.model_validate_json(interaction.output_text)
 
 
-def store_digest(picked: list[ScrapedHeadline], bullets: list[str]) -> None:
-    """Upserts into Supabase: news_items deduped on url, news_summary
+def _resolve_source_timestamp(
+    source_ref: str, polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHeadline]
+) -> Optional[datetime]:
+    ref = source_ref.strip().upper()
+    try:
+        idx = int(ref[1:])
+    except (ValueError, IndexError):
+        return None
+
+    if ref.startswith("P") and 0 <= idx < len(polymer_news):
+        return polymer_news[idx].published_at
+    if ref.startswith("H") and 0 <= idx < len(headlines):
+        return headlines[idx].published_at
+    return None
+
+
+def store_digest(picked: list[ScrapedHeadline], bullets: list[dict]) -> None:
+    """Upserts into Supabase: news_items deduped on fingerprint (the RSS
+    article URL, doubling as the dedup key so both this and
+    plastemart_news.py's polymer rows — which have no URL, and fingerprint
+    on a content hash instead — share one unique constraint), news_summary
     always overwriting the single id=1 row. No-ops with a note if Supabase
     env vars aren't set yet.
 
-    news_summary.summary stays a plain text column (no schema migration) —
-    bullets are joined with newlines on write and split back apart by
-    whatever reads them (PolyInsights' news_digest_service.py)."""
+    news_summary.bullets is a jsonb array of {text, published_at} so each
+    point carries its own real timestamp; .summary stays a plain
+    newline-joined fallback for any reader that hasn't migrated yet."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         print("(SUPABASE_URL/SUPABASE_SERVICE_KEY not set — skipping persistence)")
         return
@@ -196,15 +303,17 @@ def store_digest(picked: list[ScrapedHeadline], bullets: list[str]) -> None:
                 "url": h.url,
                 "category": h.category,
                 "published_at": h.published_at.isoformat(),
+                "fingerprint": h.url,
             }
             for h in picked
         ]
-        client.table("news_items").upsert(rows, on_conflict="url", ignore_duplicates=True).execute()
+        client.table("news_items").upsert(rows, on_conflict="fingerprint", ignore_duplicates=True).execute()
 
     client.table("news_summary").upsert(
         {
             "id": 1,
-            "summary": "\n".join(bullets),
+            "summary": "\n".join(b["text"] for b in bullets),
+            "bullets": [{"text": b["text"], "published_at": b["published_at"].isoformat()} for b in bullets],
             "generated_at": datetime.now(timezone.utc).isoformat(),
         },
         on_conflict="id",
@@ -214,12 +323,13 @@ def store_digest(picked: list[ScrapedHeadline], bullets: list[str]) -> None:
 
 
 if __name__ == "__main__":
+    polymer_news = get_recent_polymer_news()
     fresh_headlines = get_fresh_headlines()
 
-    if not fresh_headlines:
-        print(f"No headlines found within the last {MAX_AGE_HOURS}h.")
+    if not fresh_headlines and not polymer_news:
+        print(f"No polymer price news and no headlines found within the last {MAX_AGE_HOURS}h.")
     else:
-        result = summarize_headlines(fresh_headlines)
+        result = summarize(polymer_news, fresh_headlines)
 
         # Belt-and-braces: keep only valid, in-range indices, capped at TOP_N.
         seen: set[int] = set()
@@ -237,11 +347,19 @@ if __name__ == "__main__":
             print(f"    {h.url}")
             print()
 
-        # Belt-and-braces cap, same reasoning as the indices above.
-        bullets = result.market_bullets[:MAX_SUMMARY_POINTS]
+        # Belt-and-braces cap, same reasoning as the indices above. Falls
+        # back to "now" for any bullet whose source_ref didn't resolve.
+        now = datetime.now(timezone.utc)
+        bullets = [
+            {
+                "text": b.text.strip(),
+                "published_at": _resolve_source_timestamp(b.source_ref, polymer_news, fresh_headlines) or now,
+            }
+            for b in result.market_bullets[:MAX_SUMMARY_POINTS]
+        ]
 
         print("Market Commentary")
-        for point in bullets:
-            print(f"- {point}")
+        for b in bullets:
+            print(f"- [{b['published_at'].isoformat()}] {b['text']}")
 
         store_digest(picked, bullets)

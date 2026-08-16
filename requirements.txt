@@ -1,5 +1,6 @@
 feedparser>=6.0.11
 requests>=2.32.3
+beautifulsoup4>=4.12.3
 # >=2.16.0, not >=1.0.0: the 1.x line doesn't have client.interactions (the
 # structured-output API this script uses) — an old system Python resolving
 # a 1.x install is what caused "'Client' object has no attribute

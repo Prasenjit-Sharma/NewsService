@@ -19,6 +19,26 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # plastemart_news.py only needs to run every 6h, not every hour like
+      # this workflow — gated here (rather than a separate workflow file)
+      # so both scrapers stay in one place and polymer news is always fresh
+      # before gemini_news.py reads it below.
+      - id: check_polymer
+        run: |
+          hour=$(date -u +%H)
+          if [ $((10#$hour % 6)) -eq 0 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scrape polymer price news (every 6h)
+        if: steps.check_polymer.outputs.run == 'true'
+        run: python plastemart_news.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
       - run: python gemini_news.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
