@@ -46,7 +46,11 @@ MAX_SUMMARY_POINTS = 10
 # into news_items under this category — read here as the highest-priority
 # prompt input.
 POLYMER_NEWS_CATEGORY = "Polymer News"
-POLYMER_NEWS_MAX_AGE_HOURS = 48
+# Plastemart's price-news list updates in sparse clusters (roughly every
+# 1-2 weeks), not daily — a tight window would leave Gemini with nothing
+# to prioritize most of the time. Each item still carries its own true
+# date, so nothing gets misrepresented as fresher than it is.
+POLYMER_NEWS_MAX_AGE_HOURS = 24 * 7
 POLYMER_NEWS_LIMIT = 15
 # Guaranteed in code below, not just asked for in the prompt — LLMs don't
 # reliably honor a "must include" instruction on every run.
