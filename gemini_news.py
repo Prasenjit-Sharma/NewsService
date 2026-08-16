@@ -144,15 +144,21 @@ def get_recent_polymer_news() -> list[PolymerNewsRow]:
     if client is None:
         return []
 
+    # Filtered/sorted by published_at (the real price-change date, derived
+    # from Plastemart's own date on each item) — NOT fetched_at (when our
+    # scraper first saw the row). fetched_at reflects scrape time, which on
+    # a first-ever/backfill run is "just now" for every row regardless of
+    # how old the underlying announcement actually is — using it here would
+    # make week-old rate revisions look brand new to Gemini.
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=POLYMER_NEWS_MAX_AGE_HOURS)
     try:
         response = (
             client.table("news_items")
-            .select("headline,details,fetched_at")
+            .select("headline,details,published_at")
             .eq("category", POLYMER_NEWS_CATEGORY)
-            .gte("fetched_at", cutoff.isoformat())
-            .order("fetched_at", desc=True)
+            .gte("published_at", cutoff.isoformat())
+            .order("published_at", desc=True)
             .limit(POLYMER_NEWS_LIMIT)
             .execute()
         )
@@ -161,7 +167,7 @@ def get_recent_polymer_news() -> list[PolymerNewsRow]:
 
     rows: list[PolymerNewsRow] = []
     for r in response.data:
-        published_at = datetime.fromisoformat(r["fetched_at"])
+        published_at = datetime.fromisoformat(r["published_at"])
         rows.append(
             PolymerNewsRow(
                 title=r["headline"],
@@ -176,8 +182,12 @@ def get_recent_polymer_news() -> list[PolymerNewsRow]:
 class MarketBullet(BaseModel):
     text: str = Field(
         description=(
-            "One short, concise sentence (no more than ~18 words, no leading dash or bullet "
-            "character — the UI adds that) covering a single market-relevant point."
+            "One sentence, no leading dash or bullet character — the UI adds that. For a P-list "
+            "(polymer price news) source_ref: no strict word cap — keep the concrete specifics "
+            "(company, grade(s), exact INR/MT amount, and the date) intact rather than compressing "
+            "them away; cover only ONE P-list item's price move, never merge multiple companies' or "
+            "grades' announcements into one bullet even if they happened the same day. For an H-list "
+            "(general headline) source_ref: stay concise, no more than ~18 words."
         )
     )
     source_ref: str = Field(
@@ -211,7 +221,9 @@ class RankedSummary(BaseModel):
 
 def build_prompt(polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHeadline]) -> str:
     polymer_listing = (
-        "\n".join(f"P{i}. [{p.hours_ago:.1f}h ago] {p.details}" for i, p in enumerate(polymer_news))
+        "\n".join(
+            f"P{i}. [{p.published_at.date().isoformat()}] {p.details}" for i, p in enumerate(polymer_news)
+        )
         if polymer_news
         else "(none available this run)"
     )
@@ -222,9 +234,12 @@ def build_prompt(polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHead
 You are a market intelligence analyst for a polymer/petrochemical pricing desk.
 
 POLYMER PRICE NEWS — HIGHEST PRIORITY. Real price-change announcements scraped directly from
-the Indian polymer market (last {POLYMER_NEWS_MAX_AGE_HOURS}h). If {MIN_POLYMER_BULLETS} or more
-are present, at least {MIN_POLYMER_BULLETS} of your bullets MUST be based on them (source_ref
-starting with P), placed first, ahead of anything drawn only from the general headlines below.
+the Indian polymer market, each tagged with the actual date it happened (not how long ago —
+some of these may be several days old, and that's fine, but the date you state or imply must be
+correct). If {MIN_POLYMER_BULLETS} or more are present, at least {MIN_POLYMER_BULLETS} of your
+bullets MUST be based on them (source_ref starting with P), placed first, ahead of anything drawn
+only from the general headlines below. One bullet per item — do not combine two different P-list
+entries (e.g. two different companies, or a PP move and a separate PE move) into one bullet.
 
 {polymer_listing}
 
