@@ -48,6 +48,9 @@ MAX_SUMMARY_POINTS = 10
 POLYMER_NEWS_CATEGORY = "Polymer News"
 POLYMER_NEWS_MAX_AGE_HOURS = 48
 POLYMER_NEWS_LIMIT = 15
+# Guaranteed in code below, not just asked for in the prompt — LLMs don't
+# reliably honor a "must include" instruction on every run.
+MIN_POLYMER_BULLETS = 2
 
 # One Google News RSS search per topic — "when:1d" is Google's own (loose)
 # recency filter; get_fresh_headlines() re-checks precisely against each
@@ -199,8 +202,9 @@ class RankedSummary(BaseModel):
         description=(
             f"At most {MAX_SUMMARY_POINTS} bullet points synthesizing the key market impacts "
             "and geopolitical developments, focused on drivers relevant to polymer/petrochemical "
-            "pricing. If any polymer price news (P-list) is present, it must be represented first, "
-            "ahead of bullets drawn only from general headlines. Most significant point first."
+            f"pricing. If the P-list has {MIN_POLYMER_BULLETS} or more items, at least "
+            f"{MIN_POLYMER_BULLETS} bullets MUST have a P# source_ref, placed first, ahead of "
+            "bullets drawn only from general headlines. Most significant point first."
         )
     )
 
@@ -218,8 +222,9 @@ def build_prompt(polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHead
 You are a market intelligence analyst for a polymer/petrochemical pricing desk.
 
 POLYMER PRICE NEWS — HIGHEST PRIORITY. Real price-change announcements scraped directly from
-the Indian polymer market (last {POLYMER_NEWS_MAX_AGE_HOURS}h). If any are present, your bullets
-MUST reflect them first, ahead of anything drawn only from the general headlines below.
+the Indian polymer market (last {POLYMER_NEWS_MAX_AGE_HOURS}h). If {MIN_POLYMER_BULLETS} or more
+are present, at least {MIN_POLYMER_BULLETS} of your bullets MUST be based on them (source_ref
+starting with P), placed first, ahead of anything drawn only from the general headlines below.
 
 {polymer_listing}
 
@@ -350,13 +355,34 @@ if __name__ == "__main__":
         # Belt-and-braces cap, same reasoning as the indices above. Falls
         # back to "now" for any bullet whose source_ref didn't resolve.
         now = datetime.now(timezone.utc)
+        capped_bullets = result.market_bullets[:MAX_SUMMARY_POINTS]
         bullets = [
             {
                 "text": b.text.strip(),
                 "published_at": _resolve_source_timestamp(b.source_ref, polymer_news, fresh_headlines) or now,
             }
-            for b in result.market_bullets[:MAX_SUMMARY_POINTS]
+            for b in capped_bullets
         ]
+
+        # Guarantee, rather than just ask: if enough polymer price news
+        # exists, make sure it's actually represented — Gemini doesn't
+        # always follow the priority instruction. Promote unused P-items
+        # to the front, ahead of whatever Gemini wrote, and trim the tail
+        # back down to MAX_SUMMARY_POINTS so genuinely low-priority
+        # general-headline bullets are what gets dropped.
+        polymer_wanted = min(MIN_POLYMER_BULLETS, len(polymer_news))
+        used_polymer_indices = {
+            int(b.source_ref[1:]) for b in capped_bullets if b.source_ref.startswith("P")
+        }
+        polymer_bullet_count = len(used_polymer_indices)
+        for i, p in enumerate(polymer_news):
+            if polymer_bullet_count >= polymer_wanted:
+                break
+            if i in used_polymer_indices:
+                continue
+            bullets.insert(polymer_bullet_count, {"text": p.details.strip(), "published_at": p.published_at})
+            polymer_bullet_count += 1
+        bullets = bullets[:MAX_SUMMARY_POINTS]
 
         print("Market Commentary")
         for b in bullets:

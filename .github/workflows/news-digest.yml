@@ -22,11 +22,13 @@ jobs:
       # plastemart_news.py only needs to run every 6h, not every hour like
       # this workflow — gated here (rather than a separate workflow file)
       # so both scrapers stay in one place and polymer news is always fresh
-      # before gemini_news.py reads it below.
+      # before gemini_news.py reads it below. Manual runs always scrape it
+      # too (not just on-schedule ones), so a workflow_dispatch is useful
+      # for testing/backfilling rather than a coin flip on the hour.
       - id: check_polymer
         run: |
           hour=$(date -u +%H)
-          if [ $((10#$hour % 6)) -eq 0 ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ $((10#$hour % 6)) -eq 0 ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
