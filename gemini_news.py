@@ -54,7 +54,7 @@ POLYMER_NEWS_MAX_AGE_HOURS = 24 * 7
 POLYMER_NEWS_LIMIT = 15
 # Guaranteed in code below, not just asked for in the prompt — LLMs don't
 # reliably honor a "must include" instruction on every run.
-MIN_POLYMER_BULLETS = 2
+MIN_POLYMER_BULLETS = 1
 
 # One Google News RSS search per topic — "when:1d" is Google's own (loose)
 # recency filter; get_fresh_headlines() re-checks precisely against each
@@ -62,7 +62,7 @@ MIN_POLYMER_BULLETS = 2
 RSS_TOPICS: dict[str, str] = {
     "Crude oil & energy": "crude oil OR OPEC OR oil prices OR refinery",
     "Global conflicts & geopolitics": "war OR conflict OR geopolitical tensions",
-    "India economy & energy": "India economy OR India energy OR India trade OR India politics or India Sensex or India Nifty",
+    "India economy & energy": "India economy OR India energy OR India trade OR India politics or India Sensex or India Nifty or LPG diversion or polymers or petrochemicals or refinery",
 }
 
 
@@ -191,7 +191,7 @@ class MarketBullet(BaseModel):
             "(company, grade(s), exact INR/MT amount, and the date) intact rather than compressing "
             "them away; cover only ONE P-list item's price move, never merge multiple companies' or "
             "grades' announcements into one bullet even if they happened the same day. For an H-list "
-            "(general headline) source_ref: stay concise, no more than ~18 words."
+            "(general headline) source_ref: stay concise, no more than ~25 words."
         )
     )
     source_ref: str = Field(
