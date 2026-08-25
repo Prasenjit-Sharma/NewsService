@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from calendar import timegm
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -263,28 +264,68 @@ based on.
 """.strip()
 
 
+# How many times to try the Gemini call before letting the run fail. The
+# hourly autorun's actual failures (checked against GitHub Actions run
+# logs) are almost all transient: 429 rate-limit ("Please retry in ~4-50s"),
+# 500 "high demand", or a reset connection — each one likely to succeed a
+# few seconds later, well within one job run.
+_SUMMARIZE_MAX_ATTEMPTS = 3
+# Used only when the error itself doesn't say how long to wait.
+_SUMMARIZE_FALLBACK_BACKOFF_SECONDS = (5, 20)
+
+
+def _retry_delay_seconds(exc: Exception, fallback: float) -> float:
+    """Prefers the API's own Retry-After header (present on the 429/500
+    responses this project actually hits) over a fixed guess."""
+    response = getattr(exc, "response", None)
+    header = getattr(response, "headers", None)
+    retry_after = header.get("retry-after") if header is not None else None
+    if retry_after:
+        try:
+            return max(float(retry_after), 1.0)
+        except ValueError:
+            pass
+    return fallback
+
+
 def summarize(polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHeadline]) -> RankedSummary:
     # attempts=1 disables the SDK's default retry-on-429 behavior, which
-    # would otherwise burn through this project's small free-tier quota
-    # retrying a request that's already over the per-minute limit.
+    # retries near-instantly and would burn through this project's small
+    # free-tier quota on a request that's already over the per-minute
+    # limit — the bounded, backed-off retry loop below replaces it.
     client = genai.Client(
         api_key=GEMINI_API_KEY,
         http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1)),
     )
 
-    interaction = client.interactions.create(
-        model=GEMINI_MODEL,
-        input=build_prompt(polymer_news, headlines),
-        # No tools needed — the model is summarizing/ranking headlines we
-        # already fetched, not searching the web itself.
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": RankedSummary.model_json_schema(),
-        },
-    )
+    for attempt in range(_SUMMARIZE_MAX_ATTEMPTS):
+        try:
+            interaction = client.interactions.create(
+                model=GEMINI_MODEL,
+                input=build_prompt(polymer_news, headlines),
+                # No tools needed — the model is summarizing/ranking
+                # headlines we already fetched, not searching the web itself.
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": RankedSummary.model_json_schema(),
+                },
+            )
+            return RankedSummary.model_validate_json(interaction.output_text)
+        except Exception as exc:
+            if attempt == _SUMMARIZE_MAX_ATTEMPTS - 1:
+                raise
+            fallback = _SUMMARIZE_FALLBACK_BACKOFF_SECONDS[
+                min(attempt, len(_SUMMARIZE_FALLBACK_BACKOFF_SECONDS) - 1)
+            ]
+            delay = _retry_delay_seconds(exc, fallback)
+            print(
+                f"Gemini call failed ({exc.__class__.__name__}: {exc}); "
+                f"retrying in {delay:.0f}s (attempt {attempt + 2}/{_SUMMARIZE_MAX_ATTEMPTS})..."
+            )
+            time.sleep(delay)
 
-    return RankedSummary.model_validate_json(interaction.output_text)
+    raise AssertionError("unreachable")  # loop always returns or raises
 
 
 def _resolve_source_timestamp(
