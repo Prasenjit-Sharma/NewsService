@@ -41,7 +41,8 @@ HEADERS = {
 
 MAX_AGE_HOURS = 24
 TOP_N = 15
-MAX_SUMMARY_POINTS = 10
+SUMMARY_MIN_WORDS = 200
+SUMMARY_MAX_WORDS = 300
 
 # One Google News RSS search per topic — "when:1d" is Google's own (loose)
 # recency filter; get_fresh_headlines() re-checks precisely against each
@@ -117,20 +118,6 @@ def get_fresh_headlines() -> list[ScrapedHeadline]:
     return fresh
 
 
-class MarketBullet(BaseModel):
-    text: str = Field(
-        description=(
-            "One sentence, no leading dash or bullet character — the UI adds that. Stay concise, no "
-            "more than ~25 words. Cover only ONE headline's development, never merge two distinct "
-            "developments into one bullet even if they happened the same day."
-        )
-    )
-    source_ref: str = Field(
-        pattern=r"^H\d+$",
-        description="The single H# label from the list above that this bullet is primarily based on, e.g. 'H5'.",
-    )
-
-
 class RankedSummary(BaseModel):
     selected_indices: list[int] = Field(
         description=(
@@ -140,14 +127,14 @@ class RankedSummary(BaseModel):
             "energy developments). Ordered most significant first."
         )
     )
-    market_bullets: list[MarketBullet] = Field(
+    summary: str = Field(
         description=(
-            f"At most {MAX_SUMMARY_POINTS} bullet points synthesizing the key market impacts and "
-            "geopolitical developments from the H-list, focused on drivers relevant to polymer/"
-            "petrochemical pricing (crude, energy, conflict, India economy). Most significant point "
-            "first. Specific polymer/grade price moves are NOT this list's job — those are surfaced "
-            "elsewhere as structured price-event cards — so don't invent or restate one here even if "
-            "a headline happens to mention a price."
+            f"ONE cohesive paragraph, {SUMMARY_MIN_WORDS}-{SUMMARY_MAX_WORDS} words, synthesizing the "
+            "overall market situation across ALL the headlines below — crude oil trajectory, "
+            "geopolitical developments, and India-specific economic conditions woven together as a "
+            "narrative for a polymer/petrochemical pricing desk, not a list of disconnected facts and "
+            "not a bullet-by-bullet restatement of individual headlines. Prose only, no bullet points, "
+            "no headers, no leading dash."
         )
     )
 
@@ -170,8 +157,10 @@ supply, global conflicts/geopolitical tensions affecting energy or trade, and In
 economic/energy developments), ordered most significant first, and return their H-indices as
 selected_indices.
 
-Then write at most {MAX_SUMMARY_POINTS} bullet points synthesizing the key market impacts, most
-significant first, tagging each with the single H# label it's primarily based on.
+Then, reading across ALL the headlines above (not just the selected subset), write ONE cohesive
+paragraph of {SUMMARY_MIN_WORDS}-{SUMMARY_MAX_WORDS} words summarizing the overall market
+situation and its likely bearing on polymer/petrochemical pricing — a narrative a trader could read
+in one pass, not a list of separate facts.
 """.strip()
 
 
@@ -239,18 +228,7 @@ def summarize(headlines: list[ScrapedHeadline]) -> RankedSummary:
     raise AssertionError("unreachable")  # loop always returns or raises
 
 
-def _resolve_source_timestamp(source_ref: str, headlines: list[ScrapedHeadline]) -> Optional[datetime]:
-    ref = source_ref.strip().upper()
-    try:
-        idx = int(ref[1:])
-    except (ValueError, IndexError):
-        return None
-    if ref.startswith("H") and 0 <= idx < len(headlines):
-        return headlines[idx].published_at
-    return None
-
-
-def store_digest(picked: list[ScrapedHeadline], bullets: list[dict]) -> None:
+def store_digest(picked: list[ScrapedHeadline], summary_text: str) -> None:
     """Upserts into Supabase: news_items deduped on fingerprint (the RSS
     article URL — polymer price rows from plastemart_news.py live in the
     same table but are written and deduped separately, on their own
@@ -260,14 +238,10 @@ def store_digest(picked: list[ScrapedHeadline], bullets: list[dict]) -> None:
     given day from Content Control. No-ops with a note if Supabase env vars
     aren't set yet.
 
-    Only {summary_date, auto_bullets, auto_summary, generated_at} are sent
-    on the upsert — Supabase's upsert only touches the columns given, so an
-    admin's mode/override_bullets edit for today is never clobbered by this
-    nightly write landing on the same row.
-
-    auto_bullets is a jsonb array of {text, published_at} so each point
-    carries its own real timestamp; auto_summary stays a plain
-    newline-joined fallback for any reader that hasn't migrated yet."""
+    Only {summary_date, auto_summary, generated_at} are sent on the upsert
+    — Supabase's upsert only touches the columns given, so an admin's
+    mode/override_summary edit for today is never clobbered by this nightly
+    write landing on the same row."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         print("(SUPABASE_URL/SUPABASE_SERVICE_KEY not set — skipping persistence)")
         return
@@ -291,14 +265,13 @@ def store_digest(picked: list[ScrapedHeadline], bullets: list[dict]) -> None:
     client.table("market_summary_daily").upsert(
         {
             "summary_date": today,
-            "auto_summary": "\n".join(b["text"] for b in bullets),
-            "auto_bullets": [{"text": b["text"], "published_at": b["published_at"].isoformat()} for b in bullets],
+            "auto_summary": summary_text,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         },
         on_conflict="summary_date",
     ).execute()
 
-    print(f"Stored {len(picked)} headline(s) + {len(bullets)} summary point(s) in Supabase (date={today}).")
+    print(f"Stored {len(picked)} headline(s) + a {len(summary_text.split())}-word summary in Supabase (date={today}).")
 
 
 if __name__ == "__main__":
@@ -325,20 +298,8 @@ if __name__ == "__main__":
             print(f"    {h.url}")
             print()
 
-        # Belt-and-braces cap, same reasoning as the indices above. Falls
-        # back to "now" for any bullet whose source_ref didn't resolve.
-        now = datetime.now(timezone.utc)
-        capped_bullets = result.market_bullets[:MAX_SUMMARY_POINTS]
-        bullets = [
-            {
-                "text": b.text.strip(),
-                "published_at": _resolve_source_timestamp(b.source_ref, fresh_headlines) or now,
-            }
-            for b in capped_bullets
-        ]
+        summary_text = result.summary.strip()
+        print("Market Commentary\n")
+        print(summary_text)
 
-        print("Market Commentary")
-        for b in bullets:
-            print(f"- [{b['published_at'].isoformat()}] {b['text']}")
-
-        store_digest(picked, bullets)
+        store_digest(picked, summary_text)

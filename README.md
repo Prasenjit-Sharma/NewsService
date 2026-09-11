@@ -3,20 +3,25 @@
 One hourly GitHub Actions workflow (`news-digest`) running two scripts:
 
 - **`plastemart_news.py`** — scrapes Plastemart's "what's new" price-news
-  list, asks Gemini to extract structured fields (product, direction,
-  amount, unit, effective date, company) from each caption, and groups
-  same-day/same-amount announcements from different companies into one
-  deduped row with crisp, company-free text. Gated to actually run only
-  every 6th invocation (UTC hour divisible by 6) inside the hourly
+  list and, in ONE Gemini call, hands over the WHOLE batch of scraped
+  captions and asks it to assess and return the final, deduplicated list of
+  distinct price moves per grade — company names go in but never come back
+  out, so several companies announcing the same move (even if worded
+  slightly differently) collapse into one row with crisp, company-free
+  text. This is Gemini doing the consolidation judgment call directly,
+  not Python grouping by an exact-match tuple afterward. Gated to actually
+  run only every 6th invocation (UTC hour divisible by 6) inside the hourly
   workflow, rather than a separate workflow file, so both scrapers live in
   one place and stay easy to reason about together.
 - **`gemini_news.py`** — fetches real, recent GENERAL headlines (crude
-  oil/energy, global conflicts/geopolitics, India economy) via RSS and asks
-  Gemini to rank the most relevant subset and write a concise
-  market-commentary summary for a polymer/petrochemical pricing desk.
-  Deliberately does NOT read polymer price news — those are surfaced
-  directly as structured metric cards (see plastemart_news.py above), not
-  folded into this prose summary. Runs every hour.
+  oil/energy, global conflicts/geopolitics, India economy) via RSS and, in
+  ONE Gemini call, asks it to both rank the most relevant subset (for the
+  public news feed) and write ONE cohesive 200-300 word paragraph
+  synthesizing the overall market situation across all of them — prose, not
+  a bulleted list of per-headline one-liners. Deliberately does NOT read
+  polymer price news — those are surfaced directly as structured metric
+  cards (see plastemart_news.py above), not folded into this narrative.
+  Runs every hour.
 
 Both print their results and, if Supabase credentials are set, upsert into
 Supabase too — same Supabase project PolyInsights is migrating its other
@@ -43,18 +48,17 @@ create table news_items (
   -- The real dedup key: RSS rows use their article url; polymer rows (no
   -- url) use the event_key content hash instead — see plastemart_news.py.
   fingerprint text not null unique,
-  -- Structured fields, populated only for polymer price-news rows that
-  -- plastemart_news.py successfully extracted with Gemini. Several
-  -- companies announcing the same move (same product/direction/amount/
-  -- date) collapse into ONE row here — `companies` keeps the full list for
-  -- audit, but PolyInsights never displays it, only the crisp
-  -- product+amount+date text (`headline`/`details`).
+  -- Structured fields, populated only for polymer price-news rows Gemini
+  -- successfully assessed (see plastemart_news.py's _consolidate_price_events
+  -- — it does the cross-company merge itself, in one call over the whole
+  -- scraped batch, not Python grouping afterward). Company names are read
+  -- by Gemini but never returned, so there's nothing to store per row.
   product text,
   direction text,          -- up | down
   delta_amount numeric,
   delta_unit text,          -- e.g. "Rs./MT"
   effective_date date,
-  companies text[],
+  companies text[],        -- unused going forward; kept for compatibility
   event_key text,
   -- Curation, set by PolyInsights' Content Control admin page — every row
   -- (scraped or hand-authored there) gets sane defaults on insert.
@@ -68,16 +72,19 @@ create table news_items (
 
 create table market_summary_daily (
   summary_date date primary key,
-  -- What gemini_news.py generated for this date.
-  auto_bullets jsonb,       -- [{text, published_at}, ...]
-  auto_summary text,        -- legacy newline-joined fallback
+  -- The single 200-300 word paragraph gemini_news.py generated for this date.
+  auto_summary text,
   -- Admin override, set from PolyInsights' Content Control page — never
   -- touched by gemini_news.py's upsert (see store_digest's docstring).
   mode text not null default 'auto',  -- auto | hidden | custom
-  override_bullets jsonb,
+  override_summary text,
   generated_at timestamptz,
   updated_at timestamptz,
-  updated_by text
+  updated_by text,
+  -- Superseded by auto_summary/override_summary (single paragraph, not a
+  -- bulleted list); left in place, unused, rather than dropped.
+  auto_bullets jsonb,
+  override_bullets jsonb
 );
 ```
 
@@ -108,9 +115,11 @@ alter table news_items add constraint news_items_fingerprint_key unique (fingerp
 alter table news_items alter column url drop not null;
 alter table news_items drop constraint if exists news_items_url_key;
 
--- Structured price-event fields + curation columns + market_summary_daily —
--- see backend/supabase/news_admin_control.sql in PolyInsights for the full
--- migration (it's run there since that repo owns admin-writable schema).
+-- Structured price-event fields + curation columns + market_summary_daily
+-- (including its override_summary column, added after the paragraph-
+-- summary redesign) — see backend/supabase/news_admin_control.sql and
+-- news_admin_summary_paragraph.sql in PolyInsights for the full migrations
+-- (run there since that repo owns admin-writable schema).
 ```
 
 ## Local setup
