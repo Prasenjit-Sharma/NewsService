@@ -70,21 +70,20 @@ create table news_items (
   updated_at timestamptz
 );
 
-create table market_summary_daily (
+create table news_summary (
   summary_date date primary key,
-  -- The single 200-300 word paragraph gemini_news.py generated for this date.
-  auto_summary text,
+  -- Gemini generates BOTH in one call: teaser is a single 20-30 word
+  -- takeaway, drivers are 3-5 thematic points ({label, text} each) — not
+  -- one long paragraph (that read as "very unreadable" in practice).
+  auto_teaser text,
+  auto_drivers jsonb,
   -- Admin override, set from PolyInsights' Content Control page — never
   -- touched by gemini_news.py's upsert (see store_digest's docstring).
   mode text not null default 'auto',  -- auto | hidden | custom
   override_summary text,
   generated_at timestamptz,
   updated_at timestamptz,
-  updated_by text,
-  -- Superseded by auto_summary/override_summary (single paragraph, not a
-  -- bulleted list); left in place, unused, rather than dropped.
-  auto_bullets jsonb,
-  override_bullets jsonb
+  updated_by text
 );
 ```
 
@@ -94,19 +93,31 @@ holds the crisp, deduped price-move text, `details` mirrors it, and `url`
 is null since Plastemart has no per-article link. `gemini_news.py` does NOT
 read it — polymer rows go straight to PolyInsights' "What Moved" metric
 cards as structured data, never folded into the prose Market Commentary
-(`market_summary_daily`), which is built purely from general RSS headlines.
-Both news_items and market_summary_daily respect `visible`/`pinned`/`mode`,
-curated from Content Control.
+(`news_summary`), which is built purely from general RSS headlines. Both
+news_items and news_summary respect `visible`/`pinned`/`mode`, curated
+from Content Control.
 
-`news_summary` (the old singleton commentary row) is superseded by
-`market_summary_daily`, kept per calendar day instead of overwritten —
-`gemini_news.py` no longer writes to `news_summary`.
+`news_summary` is a day-by-day history table (one row per calendar day,
+kept forever), not the old singleton commentary row — that original
+`news_summary` (a single id=1 row, overwritten nightly) was dropped, and
+the table that replaced it — originally named `market_summary_daily` while
+`news_summary` still meant the old singleton — was renamed into
+`news_summary` once the old one was gone, so the name now matches what it
+actually is. See PolyInsights' `news_summary_rename.sql`.
+
+`news_items` only keeps RSS headlines (`category != 'Polymer News'`) for
+3 days — `cleanup_news_items.py`, run daily by the workflow, deletes a
+day's headlines only once that day already has a `news_summary` row, so
+nothing is lost before ever being distilled. Polymer price rows are never
+touched by this cleanup (kept forever — they're the metric-card history,
+not disposable raw text). `backfill_summary.py` was a one-time script used
+to backfill `news_summary` for days that predated the daily-summary
+feature; it's deleted once that gap is filled (see git history if you need
+it again).
 
 If `news_items`/`news_summary` already exist from before this shape, run:
 
 ```sql
-alter table news_summary add column if not exists bullets jsonb;
-
 alter table news_items add column if not exists details text;
 alter table news_items add column if not exists fingerprint text;
 update news_items set fingerprint = url where fingerprint is null;
@@ -115,11 +126,10 @@ alter table news_items add constraint news_items_fingerprint_key unique (fingerp
 alter table news_items alter column url drop not null;
 alter table news_items drop constraint if exists news_items_url_key;
 
--- Structured price-event fields + curation columns + market_summary_daily
--- (including its override_summary column, added after the paragraph-
--- summary redesign) — see backend/supabase/news_admin_control.sql and
--- news_admin_summary_paragraph.sql in PolyInsights for the full migrations
--- (run there since that repo owns admin-writable schema).
+-- Structured price-event fields + curation columns + the news_summary
+-- rename — see backend/supabase/news_admin_control.sql and
+-- news_summary_rename.sql in PolyInsights for the full migrations (run
+-- there since that repo owns admin-writable schema).
 ```
 
 ## Local setup

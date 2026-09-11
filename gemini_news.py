@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from calendar import timegm
 from dataclasses import dataclass
@@ -185,9 +186,16 @@ _SUMMARIZE_MAX_ATTEMPTS = 3
 _SUMMARIZE_FALLBACK_BACKOFF_SECONDS = (5, 20)
 
 
+_RETRY_IN_PATTERN = re.compile(r"retry in ([\d.]+)s", re.IGNORECASE)
+
+
 def _retry_delay_seconds(exc: Exception, fallback: float) -> float:
-    """Prefers the API's own Retry-After header (present on the 429/500
-    responses this project actually hits) over a fixed guess."""
+    """Prefers the API's own suggested wait over a fixed guess: a
+    Retry-After header when present, otherwise the "Please retry in Xs"
+    text Gemini's 429 body actually carries (the SDK doesn't surface that
+    as a header — confirmed live when the backfill script's fixed (5, 20)
+    backoff kept losing a race against a suggested ~35-50s wait and
+    crashed the whole run instead of pausing through it)."""
     response = getattr(exc, "response", None)
     header = getattr(response, "headers", None)
     retry_after = header.get("retry-after") if header is not None else None
@@ -196,6 +204,9 @@ def _retry_delay_seconds(exc: Exception, fallback: float) -> float:
             return max(float(retry_after), 1.0)
         except ValueError:
             pass
+    match = _RETRY_IN_PATTERN.search(str(exc))
+    if match:
+        return max(float(match.group(1)), 1.0) + 2.0  # small buffer past the window edge
     return fallback
 
 
