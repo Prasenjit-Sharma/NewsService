@@ -127,6 +127,13 @@ class RankedSummary(BaseModel):
             "energy developments). Ordered most significant first."
         )
     )
+    teaser: str = Field(
+        description=(
+            "ONE punchy sentence, 20-30 words, distilling the single most important takeaway from "
+            "your summary below — for a reader who only has a few seconds, not necessarily whatever "
+            "happens to be the summary's first sentence. Prose, no leading dash, no bullet."
+        )
+    )
     summary: str = Field(
         description=(
             f"ONE cohesive paragraph, {SUMMARY_MIN_WORDS}-{SUMMARY_MAX_WORDS} words, synthesizing the "
@@ -157,10 +164,12 @@ supply, global conflicts/geopolitical tensions affecting energy or trade, and In
 economic/energy developments), ordered most significant first, and return their H-indices as
 selected_indices.
 
-Then, reading across ALL the headlines above (not just the selected subset), write ONE cohesive
-paragraph of {SUMMARY_MIN_WORDS}-{SUMMARY_MAX_WORDS} words summarizing the overall market
-situation and its likely bearing on polymer/petrochemical pricing — a narrative a trader could read
-in one pass, not a list of separate facts.
+Then, reading across ALL the headlines above (not just the selected subset), write TWO things:
+1. teaser — ONE punchy sentence, 20-30 words, the single most important takeaway, for a reader who
+   only has a few seconds.
+2. summary — ONE cohesive paragraph of {SUMMARY_MIN_WORDS}-{SUMMARY_MAX_WORDS} words giving the
+   full picture and its likely bearing on polymer/petrochemical pricing — a narrative a trader
+   could read in one pass, not a list of separate facts.
 """.strip()
 
 
@@ -228,7 +237,7 @@ def summarize(headlines: list[ScrapedHeadline]) -> RankedSummary:
     raise AssertionError("unreachable")  # loop always returns or raises
 
 
-def store_digest(picked: list[ScrapedHeadline], summary_text: str) -> None:
+def store_digest(picked: list[ScrapedHeadline], teaser_text: str, summary_text: str) -> None:
     """Upserts into Supabase: news_items deduped on fingerprint (the RSS
     article URL — polymer price rows from plastemart_news.py live in the
     same table but are written and deduped separately, on their own
@@ -238,10 +247,10 @@ def store_digest(picked: list[ScrapedHeadline], summary_text: str) -> None:
     given day from Content Control. No-ops with a note if Supabase env vars
     aren't set yet.
 
-    Only {summary_date, auto_summary, generated_at} are sent on the upsert
-    — Supabase's upsert only touches the columns given, so an admin's
-    mode/override_summary edit for today is never clobbered by this nightly
-    write landing on the same row."""
+    Only {summary_date, auto_teaser, auto_summary, generated_at} are sent
+    on the upsert — Supabase's upsert only touches the columns given, so an
+    admin's mode/override_summary edit for today is never clobbered by this
+    nightly write landing on the same row."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         print("(SUPABASE_URL/SUPABASE_SERVICE_KEY not set — skipping persistence)")
         return
@@ -265,6 +274,7 @@ def store_digest(picked: list[ScrapedHeadline], summary_text: str) -> None:
     client.table("market_summary_daily").upsert(
         {
             "summary_date": today,
+            "auto_teaser": teaser_text,
             "auto_summary": summary_text,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         },
@@ -298,8 +308,10 @@ if __name__ == "__main__":
             print(f"    {h.url}")
             print()
 
+        teaser_text = result.teaser.strip()
         summary_text = result.summary.strip()
         print("Market Commentary\n")
+        print(f"Teaser: {teaser_text}\n")
         print(summary_text)
 
-        store_digest(picked, summary_text)
+        store_digest(picked, teaser_text, summary_text)
