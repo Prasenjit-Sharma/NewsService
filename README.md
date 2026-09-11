@@ -3,15 +3,20 @@
 One hourly GitHub Actions workflow (`news-digest`) running two scripts:
 
 - **`plastemart_news.py`** — scrapes Plastemart's "what's new" price-news
-  list directly (no Gemini involved) and persists it, deduped. Gated to
-  actually run only every 6th invocation (UTC hour divisible by 6) inside
-  the hourly workflow, rather than a separate workflow file, so both
-  scrapers live in one place and stay easy to reason about together.
-- **`gemini_news.py`** — fetches real, recent headlines (crude oil/energy,
-  global conflicts/geopolitics, India economy) via RSS, reads the latest
-  polymer price news as its highest-priority input, and asks Gemini to
-  rank the most relevant subset and write a concise market-commentary
-  summary for a polymer/petrochemical pricing desk. Runs every hour.
+  list, asks Gemini to extract structured fields (product, direction,
+  amount, unit, effective date, company) from each caption, and groups
+  same-day/same-amount announcements from different companies into one
+  deduped row with crisp, company-free text. Gated to actually run only
+  every 6th invocation (UTC hour divisible by 6) inside the hourly
+  workflow, rather than a separate workflow file, so both scrapers live in
+  one place and stay easy to reason about together.
+- **`gemini_news.py`** — fetches real, recent GENERAL headlines (crude
+  oil/energy, global conflicts/geopolitics, India economy) via RSS and asks
+  Gemini to rank the most relevant subset and write a concise
+  market-commentary summary for a polymer/petrochemical pricing desk.
+  Deliberately does NOT read polymer price news — those are surfaced
+  directly as structured metric cards (see plastemart_news.py above), not
+  folded into this prose summary. Runs every hour.
 
 Both print their results and, if Supabase credentials are set, upsert into
 Supabase too — same Supabase project PolyInsights is migrating its other
@@ -79,11 +84,12 @@ create table market_summary_daily (
 Polymer price news (`plastemart_news.py`) lives in `news_items` too,
 tagged `category = 'Polymer News'`, rather than its own table — `headline`
 holds the crisp, deduped price-move text, `details` mirrors it, and `url`
-is null since Plastemart has no per-article link. `gemini_news.py` reads it
-back from there as Market Commentary's highest-priority input, and
-PolyInsights reads it into the "What Moved" metric cards on the public
-Global News feed alongside RSS headlines (both respect `visible`/`pinned`,
-curated from Content Control).
+is null since Plastemart has no per-article link. `gemini_news.py` does NOT
+read it — polymer rows go straight to PolyInsights' "What Moved" metric
+cards as structured data, never folded into the prose Market Commentary
+(`market_summary_daily`), which is built purely from general RSS headlines.
+Both news_items and market_summary_daily respect `visible`/`pinned`/`mode`,
+curated from Content Control.
 
 `news_summary` (the old singleton commentary row) is superseded by
 `market_summary_daily`, kept per calendar day instead of overwritten —

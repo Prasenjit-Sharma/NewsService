@@ -43,20 +43,6 @@ MAX_AGE_HOURS = 24
 TOP_N = 15
 MAX_SUMMARY_POINTS = 10
 
-# Polymer price news is scraped separately (plastemart_news.py, every 6h)
-# into news_items under this category — read here as the highest-priority
-# prompt input.
-POLYMER_NEWS_CATEGORY = "Polymer News"
-# Plastemart's price-news list updates in sparse clusters (roughly every
-# 1-2 weeks), not daily — a tight window would leave Gemini with nothing
-# to prioritize most of the time. Each item still carries its own true
-# date, so nothing gets misrepresented as fresher than it is.
-POLYMER_NEWS_MAX_AGE_HOURS = 24 * 7
-POLYMER_NEWS_LIMIT = 15
-# Guaranteed in code below, not just asked for in the prompt — LLMs don't
-# reliably honor a "must include" instruction on every run.
-MIN_POLYMER_BULLETS = 1
-
 # One Google News RSS search per topic — "when:1d" is Google's own (loose)
 # recency filter; get_fresh_headlines() re-checks precisely against each
 # entry's real published timestamp below.
@@ -131,76 +117,17 @@ def get_fresh_headlines() -> list[ScrapedHeadline]:
     return fresh
 
 
-@dataclass
-class PolymerNewsRow:
-    title: str
-    details: str
-    published_at: datetime
-    hours_ago: float
-
-
-def get_recent_polymer_news() -> list[PolymerNewsRow]:
-    """Reads price-news rows written by plastemart_news.py (runs every 6h,
-    separate schedule) into the same news_items table as RSS headlines,
-    tagged category="Polymer News" — treated as the highest-priority
-    prompt input since it's a direct, real price-change announcement
-    rather than a headline Gemini has to infer market relevance from."""
-    client = _get_client()
-    if client is None:
-        return []
-
-    # Filtered/sorted by published_at (the real price-change date, derived
-    # from Plastemart's own date on each item) — NOT fetched_at (when our
-    # scraper first saw the row). fetched_at reflects scrape time, which on
-    # a first-ever/backfill run is "just now" for every row regardless of
-    # how old the underlying announcement actually is — using it here would
-    # make week-old rate revisions look brand new to Gemini.
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=POLYMER_NEWS_MAX_AGE_HOURS)
-    try:
-        response = (
-            client.table("news_items")
-            .select("headline,details,published_at")
-            .eq("category", POLYMER_NEWS_CATEGORY)
-            .gte("published_at", cutoff.isoformat())
-            .order("published_at", desc=True)
-            .limit(POLYMER_NEWS_LIMIT)
-            .execute()
-        )
-    except Exception:
-        return []
-
-    rows: list[PolymerNewsRow] = []
-    for r in response.data:
-        published_at = datetime.fromisoformat(r["published_at"])
-        rows.append(
-            PolymerNewsRow(
-                title=r["headline"],
-                details=r["details"],
-                published_at=published_at,
-                hours_ago=(now - published_at).total_seconds() / 3600,
-            )
-        )
-    return rows
-
-
 class MarketBullet(BaseModel):
     text: str = Field(
         description=(
-            "One sentence, no leading dash or bullet character — the UI adds that. For a P-list "
-            "(polymer price news) source_ref: no strict word cap — keep the concrete specifics "
-            "(company, grade(s), exact INR/MT amount, and the date) intact rather than compressing "
-            "them away; cover only ONE P-list item's price move, never merge multiple distinct grade "
-            "moves into one bullet even if they happened the same day. For an H-list "
-            "(general headline) source_ref: stay concise, no more than ~25 words."
+            "One sentence, no leading dash or bullet character — the UI adds that. Stay concise, no "
+            "more than ~25 words. Cover only ONE headline's development, never merge two distinct "
+            "developments into one bullet even if they happened the same day."
         )
     )
     source_ref: str = Field(
-        pattern=r"^[PH]\d+$",
-        description=(
-            "The single P# (polymer price news) or H# (general headline) label from the lists "
-            "above that this bullet is primarily based on, e.g. 'P2' or 'H5'."
-        ),
+        pattern=r"^H\d+$",
+        description="The single H# label from the list above that this bullet is primarily based on, e.g. 'H5'.",
     )
 
 
@@ -215,52 +142,36 @@ class RankedSummary(BaseModel):
     )
     market_bullets: list[MarketBullet] = Field(
         description=(
-            f"At most {MAX_SUMMARY_POINTS} bullet points synthesizing the key market impacts "
-            "and geopolitical developments, focused on drivers relevant to polymer/petrochemical "
-            f"pricing. If the P-list has {MIN_POLYMER_BULLETS} or more items, at least "
-            f"{MIN_POLYMER_BULLETS} bullets MUST have a P# source_ref, placed first, ahead of "
-            "bullets drawn only from general headlines. Most significant point first."
+            f"At most {MAX_SUMMARY_POINTS} bullet points synthesizing the key market impacts and "
+            "geopolitical developments from the H-list, focused on drivers relevant to polymer/"
+            "petrochemical pricing (crude, energy, conflict, India economy). Most significant point "
+            "first. Specific polymer/grade price moves are NOT this list's job — those are surfaced "
+            "elsewhere as structured price-event cards — so don't invent or restate one here even if "
+            "a headline happens to mention a price."
         )
     )
 
 
-def build_prompt(polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHeadline]) -> str:
-    polymer_listing = (
-        "\n".join(
-            f"P{i}. [{p.published_at.date().isoformat()}] {p.details}" for i, p in enumerate(polymer_news)
-        )
-        if polymer_news
-        else "(none available this run)"
-    )
+def build_prompt(headlines: list[ScrapedHeadline]) -> str:
     headline_listing = "\n".join(
         f"H{i}. [{h.category}] [{h.hours_ago:.1f}h ago] {h.headline}" for i, h in enumerate(headlines)
     )
     return f"""
-You are a market intelligence analyst for a polymer/petrochemical pricing desk.
-
-POLYMER PRICE NEWS — HIGHEST PRIORITY. Real price-change announcements scraped directly from
-the Indian polymer market, each tagged with the actual date it happened (not how long ago —
-some of these may be several days old, and that's fine, but the date you state or imply must be
-correct). If {MIN_POLYMER_BULLETS} or more are present, at least {MIN_POLYMER_BULLETS} of your
-bullets MUST be based on them (source_ref starting with P), placed first, ahead of anything drawn
-only from the general headlines below. One bullet per item — do not combine two different P-list
-entries (e.g. a PP move and a separate PE move) into one bullet.
-
-{polymer_listing}
-
-GENERAL MARKET HEADLINES (last {MAX_AGE_HOURS}h) — crude oil/energy, global conflicts/
-geopolitics, and India's economy. Do not invent new headlines — only choose from this list.
+You are a market intelligence analyst for a polymer/petrochemical pricing desk. You are given
+GENERAL MARKET HEADLINES (last {MAX_AGE_HOURS}h) covering crude oil/energy, global conflicts/
+geopolitics, and India's economy — NOT polymer/grade-specific price announcements, which are
+tracked and shown separately and are not your job here. Do not invent new headlines — only choose
+from this list.
 
 {headline_listing}
 
-From the general headlines (H-list) only, select at most {TOP_N} most relevant to polymer
-market drivers (crude oil prices/supply, global conflicts/geopolitical tensions affecting
-energy or trade, and India-specific economic/energy developments), ordered most significant
-first, and return their H-indices as selected_indices.
+From this list, select at most {TOP_N} most relevant to polymer market drivers (crude oil prices/
+supply, global conflicts/geopolitical tensions affecting energy or trade, and India-specific
+economic/energy developments), ordered most significant first, and return their H-indices as
+selected_indices.
 
-Then write at most {MAX_SUMMARY_POINTS} bullet points synthesizing the key market impacts across
-both lists, most significant first, tagging each with the single P#/H# label it's primarily
-based on.
+Then write at most {MAX_SUMMARY_POINTS} bullet points synthesizing the key market impacts, most
+significant first, tagging each with the single H# label it's primarily based on.
 """.strip()
 
 
@@ -288,7 +199,7 @@ def _retry_delay_seconds(exc: Exception, fallback: float) -> float:
     return fallback
 
 
-def summarize(polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHeadline]) -> RankedSummary:
+def summarize(headlines: list[ScrapedHeadline]) -> RankedSummary:
     # attempts=1 disables the SDK's default retry-on-429 behavior, which
     # retries near-instantly and would burn through this project's small
     # free-tier quota on a request that's already over the per-minute
@@ -302,7 +213,7 @@ def summarize(polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHeadlin
         try:
             interaction = client.interactions.create(
                 model=GEMINI_MODEL,
-                input=build_prompt(polymer_news, headlines),
+                input=build_prompt(headlines),
                 # No tools needed — the model is summarizing/ranking
                 # headlines we already fetched, not searching the web itself.
                 response_format={
@@ -328,17 +239,12 @@ def summarize(polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHeadlin
     raise AssertionError("unreachable")  # loop always returns or raises
 
 
-def _resolve_source_timestamp(
-    source_ref: str, polymer_news: list[PolymerNewsRow], headlines: list[ScrapedHeadline]
-) -> Optional[datetime]:
+def _resolve_source_timestamp(source_ref: str, headlines: list[ScrapedHeadline]) -> Optional[datetime]:
     ref = source_ref.strip().upper()
     try:
         idx = int(ref[1:])
     except (ValueError, IndexError):
         return None
-
-    if ref.startswith("P") and 0 <= idx < len(polymer_news):
-        return polymer_news[idx].published_at
     if ref.startswith("H") and 0 <= idx < len(headlines):
         return headlines[idx].published_at
     return None
@@ -346,13 +252,13 @@ def _resolve_source_timestamp(
 
 def store_digest(picked: list[ScrapedHeadline], bullets: list[dict]) -> None:
     """Upserts into Supabase: news_items deduped on fingerprint (the RSS
-    article URL, doubling as the dedup key so both this and
-    plastemart_news.py's polymer rows — which have no URL, and fingerprint
-    on a content hash instead — share one unique constraint), market_summary_daily
-    keyed by today's UTC date rather than the old news_summary singleton, so
-    PolyInsights can keep a day-by-day history and a superadmin can publish/
-    hide/edit any given day from Content Control. No-ops with a note if
-    Supabase env vars aren't set yet.
+    article URL — polymer price rows from plastemart_news.py live in the
+    same table but are written and deduped separately, on their own
+    event_key-based fingerprint), market_summary_daily keyed by today's UTC
+    date rather than the old news_summary singleton, so PolyInsights can
+    keep a day-by-day history and a superadmin can publish/hide/edit any
+    given day from Content Control. No-ops with a note if Supabase env vars
+    aren't set yet.
 
     Only {summary_date, auto_bullets, auto_summary, generated_at} are sent
     on the upsert — Supabase's upsert only touches the columns given, so an
@@ -396,13 +302,12 @@ def store_digest(picked: list[ScrapedHeadline], bullets: list[dict]) -> None:
 
 
 if __name__ == "__main__":
-    polymer_news = get_recent_polymer_news()
     fresh_headlines = get_fresh_headlines()
 
-    if not fresh_headlines and not polymer_news:
-        print(f"No polymer price news and no headlines found within the last {MAX_AGE_HOURS}h.")
+    if not fresh_headlines:
+        print(f"No headlines found within the last {MAX_AGE_HOURS}h.")
     else:
-        result = summarize(polymer_news, fresh_headlines)
+        result = summarize(fresh_headlines)
 
         # Belt-and-braces: keep only valid, in-range indices, capped at TOP_N.
         seen: set[int] = set()
@@ -427,30 +332,10 @@ if __name__ == "__main__":
         bullets = [
             {
                 "text": b.text.strip(),
-                "published_at": _resolve_source_timestamp(b.source_ref, polymer_news, fresh_headlines) or now,
+                "published_at": _resolve_source_timestamp(b.source_ref, fresh_headlines) or now,
             }
             for b in capped_bullets
         ]
-
-        # Guarantee, rather than just ask: if enough polymer price news
-        # exists, make sure it's actually represented — Gemini doesn't
-        # always follow the priority instruction. Promote unused P-items
-        # to the front, ahead of whatever Gemini wrote, and trim the tail
-        # back down to MAX_SUMMARY_POINTS so genuinely low-priority
-        # general-headline bullets are what gets dropped.
-        polymer_wanted = min(MIN_POLYMER_BULLETS, len(polymer_news))
-        used_polymer_indices = {
-            int(b.source_ref[1:]) for b in capped_bullets if b.source_ref.startswith("P")
-        }
-        polymer_bullet_count = len(used_polymer_indices)
-        for i, p in enumerate(polymer_news):
-            if polymer_bullet_count >= polymer_wanted:
-                break
-            if i in used_polymer_indices:
-                continue
-            bullets.insert(polymer_bullet_count, {"text": p.details.strip(), "published_at": p.published_at})
-            polymer_bullet_count += 1
-        bullets = bullets[:MAX_SUMMARY_POINTS]
 
         print("Market Commentary")
         for b in bullets:
