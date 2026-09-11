@@ -56,6 +56,24 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
+      # Once a day is enough — this only ever touches rows already several
+      # days old. Same gate shape as check_polymer above, just hour == 0.
+      - id: check_cleanup
+        run: |
+          hour=$(date -u +%H)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ $((10#$hour)) -eq 0 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clean up old, already-summarized news headlines (daily)
+        if: steps.check_cleanup.outputs.run == 'true'
+        run: python cleanup_news_items.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
       # GitHub auto-disables a scheduled workflow after 60 days with zero
       # repo activity. This is the only commit this repo ever gets, so
       # without it the schedule would eventually go quiet on its own.

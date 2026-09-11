@@ -243,10 +243,13 @@ def store_digest(picked: list[ScrapedHeadline], teaser_text: str, drivers: list[
     """Upserts into Supabase: news_items deduped on fingerprint (the RSS
     article URL — polymer price rows from plastemart_news.py live in the
     same table but are written and deduped separately, on their own
-    event_key-based fingerprint), market_summary_daily keyed by today's UTC
-    date rather than the old news_summary singleton, so PolyInsights can
-    keep a day-by-day history and a superadmin can publish/hide/edit any
-    given day from Content Control. No-ops with a note if Supabase env vars
+    event_key-based fingerprint), news_summary keyed by today's UTC date
+    (one row per calendar day — this table was the old singleton
+    id=1 row until it was repurposed for day-by-day history and renamed
+    from market_summary_daily; the original news_summary was dropped
+    first, see PolyInsights' news_summary_rename.sql) so PolyInsights can
+    keep a full history and a superadmin can publish/hide/edit any given
+    day from Content Control. No-ops with a note if Supabase env vars
     aren't set yet.
 
     Only {summary_date, auto_teaser, auto_drivers, generated_at} are sent
@@ -273,7 +276,7 @@ def store_digest(picked: list[ScrapedHeadline], teaser_text: str, drivers: list[
         client.table("news_items").upsert(rows, on_conflict="fingerprint", ignore_duplicates=True).execute()
 
     today = datetime.now(timezone.utc).date().isoformat()
-    client.table("market_summary_daily").upsert(
+    client.table("news_summary").upsert(
         {
             "summary_date": today,
             "auto_teaser": teaser_text,
