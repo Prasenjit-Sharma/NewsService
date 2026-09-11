@@ -190,8 +190,8 @@ class MarketBullet(BaseModel):
             "One sentence, no leading dash or bullet character — the UI adds that. For a P-list "
             "(polymer price news) source_ref: no strict word cap — keep the concrete specifics "
             "(company, grade(s), exact INR/MT amount, and the date) intact rather than compressing "
-            "them away; cover only ONE P-list item's price move, never merge multiple companies' or "
-            "grades' announcements into one bullet even if they happened the same day. For an H-list "
+            "them away; cover only ONE P-list item's price move, never merge multiple distinct grade "
+            "moves into one bullet even if they happened the same day. For an H-list "
             "(general headline) source_ref: stay concise, no more than ~25 words."
         )
     )
@@ -244,7 +244,7 @@ some of these may be several days old, and that's fine, but the date you state o
 correct). If {MIN_POLYMER_BULLETS} or more are present, at least {MIN_POLYMER_BULLETS} of your
 bullets MUST be based on them (source_ref starting with P), placed first, ahead of anything drawn
 only from the general headlines below. One bullet per item — do not combine two different P-list
-entries (e.g. two different companies, or a PP move and a separate PE move) into one bullet.
+entries (e.g. a PP move and a separate PE move) into one bullet.
 
 {polymer_listing}
 
@@ -348,12 +348,19 @@ def store_digest(picked: list[ScrapedHeadline], bullets: list[dict]) -> None:
     """Upserts into Supabase: news_items deduped on fingerprint (the RSS
     article URL, doubling as the dedup key so both this and
     plastemart_news.py's polymer rows — which have no URL, and fingerprint
-    on a content hash instead — share one unique constraint), news_summary
-    always overwriting the single id=1 row. No-ops with a note if Supabase
-    env vars aren't set yet.
+    on a content hash instead — share one unique constraint), market_summary_daily
+    keyed by today's UTC date rather than the old news_summary singleton, so
+    PolyInsights can keep a day-by-day history and a superadmin can publish/
+    hide/edit any given day from Content Control. No-ops with a note if
+    Supabase env vars aren't set yet.
 
-    news_summary.bullets is a jsonb array of {text, published_at} so each
-    point carries its own real timestamp; .summary stays a plain
+    Only {summary_date, auto_bullets, auto_summary, generated_at} are sent
+    on the upsert — Supabase's upsert only touches the columns given, so an
+    admin's mode/override_bullets edit for today is never clobbered by this
+    nightly write landing on the same row.
+
+    auto_bullets is a jsonb array of {text, published_at} so each point
+    carries its own real timestamp; auto_summary stays a plain
     newline-joined fallback for any reader that hasn't migrated yet."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         print("(SUPABASE_URL/SUPABASE_SERVICE_KEY not set — skipping persistence)")
@@ -374,17 +381,18 @@ def store_digest(picked: list[ScrapedHeadline], bullets: list[dict]) -> None:
         ]
         client.table("news_items").upsert(rows, on_conflict="fingerprint", ignore_duplicates=True).execute()
 
-    client.table("news_summary").upsert(
+    today = datetime.now(timezone.utc).date().isoformat()
+    client.table("market_summary_daily").upsert(
         {
-            "id": 1,
-            "summary": "\n".join(b["text"] for b in bullets),
-            "bullets": [{"text": b["text"], "published_at": b["published_at"].isoformat()} for b in bullets],
+            "summary_date": today,
+            "auto_summary": "\n".join(b["text"] for b in bullets),
+            "auto_bullets": [{"text": b["text"], "published_at": b["published_at"].isoformat()} for b in bullets],
             "generated_at": datetime.now(timezone.utc).isoformat(),
         },
-        on_conflict="id",
+        on_conflict="summary_date",
     ).execute()
 
-    print(f"Stored {len(picked)} headline(s) + {len(bullets)} summary point(s) in Supabase.")
+    print(f"Stored {len(picked)} headline(s) + {len(bullets)} summary point(s) in Supabase (date={today}).")
 
 
 if __name__ == "__main__":

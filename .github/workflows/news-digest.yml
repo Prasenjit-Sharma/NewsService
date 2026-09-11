@@ -38,6 +38,12 @@ jobs:
         if: steps.check_polymer.outputs.run == 'true'
         run: python plastemart_news.py
         env:
+          # Needed for the structured price-event extraction (product/
+          # amount/date) that dedupes same-move-different-company captions
+          # into one row — without it this step still runs, just falls back
+          # to storing every caption unstructured (no metric card).
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
