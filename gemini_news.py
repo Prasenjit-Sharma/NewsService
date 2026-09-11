@@ -41,8 +41,6 @@ HEADERS = {
 
 MAX_AGE_HOURS = 24
 TOP_N = 15
-SUMMARY_MIN_WORDS = 200
-SUMMARY_MAX_WORDS = 300
 
 # One Google News RSS search per topic — "when:1d" is Google's own (loose)
 # recency filter; get_fresh_headlines() re-checks precisely against each
@@ -118,6 +116,11 @@ def get_fresh_headlines() -> list[ScrapedHeadline]:
     return fresh
 
 
+class MarketDriver(BaseModel):
+    label: str = Field(description="A short 2-4 word theme name, e.g. 'Crude Oil', 'Geopolitics', 'India Economy'.")
+    text: str = Field(description="1-2 sentences, ~25-45 words, this theme's specific development and its market implication.")
+
+
 class RankedSummary(BaseModel):
     selected_indices: list[int] = Field(
         description=(
@@ -129,19 +132,18 @@ class RankedSummary(BaseModel):
     )
     teaser: str = Field(
         description=(
-            "ONE punchy sentence, 20-30 words, distilling the single most important takeaway from "
-            "your summary below — for a reader who only has a few seconds, not necessarily whatever "
-            "happens to be the summary's first sentence. Prose, no leading dash, no bullet."
+            "ONE punchy sentence, 20-30 words, distilling the single most important takeaway across "
+            "ALL the drivers below — for a reader who only has a few seconds, not necessarily "
+            "whatever happens to be the first driver. Prose, no leading dash, no bullet."
         )
     )
-    summary: str = Field(
+    drivers: list[MarketDriver] = Field(
         description=(
-            f"ONE cohesive paragraph, {SUMMARY_MIN_WORDS}-{SUMMARY_MAX_WORDS} words, synthesizing the "
-            "overall market situation across ALL the headlines below — crude oil trajectory, "
-            "geopolitical developments, and India-specific economic conditions woven together as a "
-            "narrative for a polymer/petrochemical pricing desk, not a list of disconnected facts and "
-            "not a bullet-by-bullet restatement of individual headlines. Prose only, no bullet points, "
-            "no headers, no leading dash."
+            "3 to 5 distinct thematic drivers synthesizing the overall market situation across ALL "
+            "the headlines below (crude oil trajectory, geopolitical developments, India-specific "
+            "economic conditions, and their bearing on polymer/petrochemical pricing) — each its own "
+            "short, scannable point, not a restatement of one individual headline and not a single "
+            "merged paragraph. Most significant driver first."
         )
     )
 
@@ -165,11 +167,11 @@ economic/energy developments), ordered most significant first, and return their 
 selected_indices.
 
 Then, reading across ALL the headlines above (not just the selected subset), write TWO things:
-1. teaser — ONE punchy sentence, 20-30 words, the single most important takeaway, for a reader who
-   only has a few seconds.
-2. summary — ONE cohesive paragraph of {SUMMARY_MIN_WORDS}-{SUMMARY_MAX_WORDS} words giving the
-   full picture and its likely bearing on polymer/petrochemical pricing — a narrative a trader
-   could read in one pass, not a list of separate facts.
+1. teaser — ONE punchy sentence, 20-30 words, the single most important takeaway across everything
+   below, for a reader who only has a few seconds.
+2. drivers — 3 to 5 distinct thematic points (each a short 2-4 word label plus a 1-2 sentence
+   takeaway) covering the overall market situation and its bearing on polymer/petrochemical
+   pricing — synthesized themes, not one bullet per headline and not a single merged paragraph.
 """.strip()
 
 
@@ -237,7 +239,7 @@ def summarize(headlines: list[ScrapedHeadline]) -> RankedSummary:
     raise AssertionError("unreachable")  # loop always returns or raises
 
 
-def store_digest(picked: list[ScrapedHeadline], teaser_text: str, summary_text: str) -> None:
+def store_digest(picked: list[ScrapedHeadline], teaser_text: str, drivers: list[dict]) -> None:
     """Upserts into Supabase: news_items deduped on fingerprint (the RSS
     article URL — polymer price rows from plastemart_news.py live in the
     same table but are written and deduped separately, on their own
@@ -247,7 +249,7 @@ def store_digest(picked: list[ScrapedHeadline], teaser_text: str, summary_text: 
     given day from Content Control. No-ops with a note if Supabase env vars
     aren't set yet.
 
-    Only {summary_date, auto_teaser, auto_summary, generated_at} are sent
+    Only {summary_date, auto_teaser, auto_drivers, generated_at} are sent
     on the upsert — Supabase's upsert only touches the columns given, so an
     admin's mode/override_summary edit for today is never clobbered by this
     nightly write landing on the same row."""
@@ -275,13 +277,13 @@ def store_digest(picked: list[ScrapedHeadline], teaser_text: str, summary_text: 
         {
             "summary_date": today,
             "auto_teaser": teaser_text,
-            "auto_summary": summary_text,
+            "auto_drivers": drivers,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         },
         on_conflict="summary_date",
     ).execute()
 
-    print(f"Stored {len(picked)} headline(s) + a {len(summary_text.split())}-word summary in Supabase (date={today}).")
+    print(f"Stored {len(picked)} headline(s) + {len(drivers)} driver(s) in Supabase (date={today}).")
 
 
 if __name__ == "__main__":
@@ -309,9 +311,10 @@ if __name__ == "__main__":
             print()
 
         teaser_text = result.teaser.strip()
-        summary_text = result.summary.strip()
+        drivers = [{"label": d.label.strip(), "text": d.text.strip()} for d in result.drivers]
         print("Market Commentary\n")
         print(f"Teaser: {teaser_text}\n")
-        print(summary_text)
+        for d in drivers:
+            print(f"- [{d['label']}] {d['text']}")
 
-        store_digest(picked, teaser_text, summary_text)
+        store_digest(picked, teaser_text, drivers)
